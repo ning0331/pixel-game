@@ -1,4 +1,50 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
+
+// ── IndexedDB helpers ──────────────────────────────────────────────
+const DB_NAME = 'pixel-game-db'
+const STORE = 'photos'
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1)
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: 'id' })
+        store.createIndex('order', 'order', { unique: false })
+      }
+    }
+    req.onsuccess = (e) => resolve(e.target.result)
+    req.onerror = (e) => reject(e.target.error)
+  })
+}
+
+function dbPut(db, record) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite')
+    tx.objectStore(STORE).put(record)
+    tx.oncomplete = resolve
+    tx.onerror = (e) => reject(e.target.error)
+  })
+}
+
+function dbDelete(db, id) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite')
+    tx.objectStore(STORE).delete(id)
+    tx.oncomplete = resolve
+    tx.onerror = (e) => reject(e.target.error)
+  })
+}
+
+function dbGetAll(db) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly')
+    const req = tx.objectStore(STORE).getAll()
+    req.onsuccess = (e) => resolve(e.target.result)
+    req.onerror = (e) => reject(e.target.error)
+  })
+}
 
 const itinerary = [
   {
@@ -172,21 +218,52 @@ export default function App() {
   const [photos, setPhotos] = useState([])
   const [lightbox, setLightbox] = useState(null) // index
   const [dragOver, setDragOver] = useState(false)
+  const [loading, setLoading] = useState(true)
   const fileInputRef = useRef()
+  const dbRef = useRef(null)
 
-  const addFiles = useCallback((files) => {
+  // 啟動時從 IndexedDB 載入已存的照片
+  useEffect(() => {
+    openDB().then(async (db) => {
+      dbRef.current = db
+      const rows = await dbGetAll(db)
+      rows.sort((a, b) => a.order - b.order)
+      const loaded = rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        type: r.type,
+        url: URL.createObjectURL(r.blob),
+      }))
+      setPhotos(loaded)
+      setLoading(false)
+    }).catch(() => setLoading(false))
+  }, [])
+
+  const addFiles = useCallback(async (files) => {
     const remaining = MAX_PHOTOS - photos.length
     if (remaining <= 0) return
     const accepted = Array.from(files)
       .filter((f) => f.type.startsWith('image/') || f.type.startsWith('video/') || f.name.toLowerCase().endsWith('.mov'))
       .slice(0, remaining)
-    const newPhotos = accepted.map((f) => ({
+    const now = Date.now()
+    const newPhotos = accepted.map((f, idx) => ({
       url: URL.createObjectURL(f),
       name: f.name,
-      id: `${f.name}-${f.lastModified}`,
+      id: `${f.name}-${f.lastModified}-${f.size}`,
       type: f.type.startsWith('video/') || f.name.toLowerCase().endsWith('.mov') ? 'video' : 'image',
+      _file: f,
+      _order: now + idx,
     }))
-    setPhotos((prev) => [...prev, ...newPhotos])
+    setPhotos((prev) => {
+      const merged = [...prev, ...newPhotos]
+      // 存到 IndexedDB（非同步，不 block UI）
+      if (dbRef.current) {
+        newPhotos.forEach((p) =>
+          dbPut(dbRef.current, { id: p.id, name: p.name, type: p.type, blob: p._file, order: p._order })
+        )
+      }
+      return merged
+    })
   }, [photos.length])
 
   const handleFiles = (e) => addFiles(e.target.files)
@@ -200,6 +277,7 @@ export default function App() {
   const removePhoto = (id, e) => {
     e.stopPropagation()
     setPhotos((prev) => prev.filter((p) => p.id !== id))
+    if (dbRef.current) dbDelete(dbRef.current, id)
   }
 
   const openLightbox = (i) => setLightbox(i)
@@ -214,6 +292,12 @@ export default function App() {
     if (e.key === 'ArrowLeft') prevPhoto()
     if (e.key === 'Escape') closeLightbox()
   }, [lightbox])
+
+  if (loading) return (
+    <div style={{ minHeight: '100vh', background: '#0d1117', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.4)', fontSize: 15 }}>
+      載入相簿中…
+    </div>
+  )
 
   return (
     <div
